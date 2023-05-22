@@ -1,4 +1,4 @@
-from typing import Dict, Text
+from typing import Dict, Text, TYPE_CHECKING
 
 import numpy as np
 
@@ -9,6 +9,8 @@ from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.controller import ControlledVehicle
 from highway_env.vehicle.objects import Obstacle
 
+if TYPE_CHECKING:
+    from highway_env.vehicle import kinematics
 
 class MergeEnv(AbstractEnv):
 
@@ -123,5 +125,106 @@ class MergeEnv(AbstractEnv):
 
         merging_v = other_vehicles_type(road, road.network.get_lane(("j", "k", 0)).position(110, 0), speed=20)
         merging_v.target_speed = 30
+        road.vehicles.append(merging_v)
+        self.vehicle = ego_vehicle
+
+class MergeEnv1(MergeEnv):
+    @classmethod
+    def default_config(cls) -> dict:
+        cfg = super().default_config()
+        cfg.update({
+            "observation": {
+            "type": "Kinematics",
+            "vehicles_count": 3,
+            "features": ["presence", "x", "y", "vx", "vy", "cos_h", "sin_h"],
+            },
+            "collision_reward": -1,
+            "high_speed_reward": 0.2,
+            "rear_distance_reward": -1,
+            "lateral_distance_reward": -1,
+        })
+        return cfg
+
+    def _reward(self, action: int) -> float:
+        """
+        The vehicle is rewarded for driving with high speed on lanes to the right and avoiding collisions
+
+        But an additional altruistic penalty is also suffered if any vehicle on the merging lane has a low speed.
+
+        :param action: the action performed
+        :return: the reward of the state-action transition
+        """
+        reward = sum(self.config.get(name, 0) * reward for name, reward in self._rewards(action).items())
+        return utils.lmap(reward,
+                          [self.config["collision_reward"],
+                           self.config["high_speed_reward"]],
+                          [0, 1])
+
+    def _rewards(self, action: int) -> Dict[Text, float]:
+        return {
+            "collision_reward": self.vehicle.crashed,
+            "high_speed_reward": self.vehicle.speed_index / (self.vehicle.target_speeds.size - 1),
+            "rear_distance_reward": self._calculate_distance_reward(self.road.vehicles[0], self.road.vehicles[1]),
+            "lateral_distance_reward": self._calculate_distance_reward(self.road.vehicles[0], self.road.vehicles[3])
+        }
+    
+    def _calculate_distance_reward(self, ego_vehicle: 'kinematics.Vehicle', other: 'kinematics.Vehicle') -> float:
+        safe_distance = 5
+
+        if np.linalg.norm(other.position - ego_vehicle.position) < safe_distance:  # If the distance between vehicles is less than the safe distance
+            return 1 / np.linalg.norm(other.position - ego_vehicle.position)
+        
+        return 0.0
+
+
+    
+    def _make_road(self) -> None:
+        """
+        Make a road composed of a straight highway and a merging lane.
+
+        :return: the road
+        """
+        net = RoadNetwork()
+
+        # Highway lanes
+        ends = [100, 30, 30, 300]  # Before, converging, merge, after
+        c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
+    
+        net.add_lane("a", "b", StraightLane([0, 0], [sum(ends[:2]), 0], line_types=[c, c]))
+        net.add_lane("b", "c", StraightLane([sum(ends[:2]), 0], [sum(ends[:3]), 0], line_types=[c, s]))
+        net.add_lane("c", "d", StraightLane([sum(ends[:3]), 0], [sum(ends), 0], line_types=[c, c]))
+
+        # Merging lane
+        amplitude = 3.25
+        ljk = StraightLane([0, 6.5 + 4], [ends[0], 6.5 + 4], line_types=[c, c], forbidden=True)
+        lkb = SineLane(ljk.position(ends[0], -amplitude), ljk.position(sum(ends[:2]), -amplitude),
+                       amplitude, 2 * np.pi / (2*ends[1]), np.pi / 2, line_types=[c, c], forbidden=True)
+        lbc = StraightLane(lkb.position(ends[1], 0), lkb.position(ends[1], 0) + [ends[2], 0],
+                           line_types=[n, c], forbidden=True)
+        
+        net.add_lane("j", "k", ljk)
+        net.add_lane("k", "b", lkb)
+        net.add_lane("b", "c", lbc)
+        road = Road(network=net, np_random=self.np_random, record_history=self.config["show_trajectories"])
+        road.objects.append(Obstacle(road, lbc.position(ends[2], 0)))
+        self.road = road
+
+    def _make_vehicles(self) -> None:
+        """
+        Populate a road with several vehicles on the highway and on the merging lane, as well as an ego-vehicle.
+
+        :return: the ego-vehicle
+        """
+        road = self.road
+        ego_vehicle = self.action_type.vehicle_class(road,
+                                                    road.network.get_lane(("a", "b", 0)).position(round(np.random.uniform(25, 30), 2), 0),
+                                                    speed=round(np.random.uniform(5, 15), 2), target_speeds=[5, 15])
+        road.vehicles.append(ego_vehicle)
+
+        other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+        road.vehicles.append(other_vehicles_type(road, road.network.get_lane(("a", "b", 0)).position(round(np.random.uniform(60, 70), 2), 0), speed=round(np.random.uniform(8, 15), 2), target_speed=15))
+        road.vehicles.append(other_vehicles_type(road, road.network.get_lane(("a", "b", 0)).position(round(np.random.uniform(0, 5), 2), 0), speed=round(np.random.uniform(8, 15), 2), target_speed=15))
+
+        merging_v = other_vehicles_type(road, road.network.get_lane(("j", "k", 0)).position(round(np.random.uniform(40, 60), 2), 0), speed=round(np.random.uniform(8, 15), 2), target_speed=15)
         road.vehicles.append(merging_v)
         self.vehicle = ego_vehicle
